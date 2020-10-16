@@ -168,3 +168,14 @@ func TestNodeGroup_Id(t *testing.T) {
 	name := ng.Id()
 	assert.Equal(t, nodePoolName, name)
 }
+
+func TestTemplateNodeInfo(t *testing.T) {
+	th.CreateServer()
+	defer th.ShutDownServer()
+
+	manager := createTestHuaweicloudManager()
+	ng := createTestNodeGroup(manager)
+
+	_, err := ng.TemplateNodeInfo()
+	assert.NoError(t, err)
+}

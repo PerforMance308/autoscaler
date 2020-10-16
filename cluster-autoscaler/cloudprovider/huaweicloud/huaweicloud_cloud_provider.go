@@ -21,8 +21,10 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	huaweicloudsdk "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go/openstack/cce/v3/clusters"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	klog "k8s.io/klog/v2"
 	"os"
@@ -32,6 +34,7 @@ import (
 const (
 	// GPULabel is the label added to nodes with GPU resource.
 	GPULabel = "cloud.google.com/gke-accelerator"
+	scaleToZeroSupported = true
 )
 
 var (
@@ -190,7 +193,7 @@ func buildHuaweiCloudManager(opts config.AutoscalingOptions, do cloudprovider.No
 }
 
 // getAutoscaleNodePools returns a slice of NodeGroup with Autoscaler label enabled.
-func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.AutoscalingOptions) []*NodeGroup {
+func getAutoscaleNodePools(manager *huaweicloudCloudManager, do cloudprovider.NodeGroupDiscoveryOptions, opts config.AutoscalingOptions) []*NodeGroup {
 	nodePools, err := clusters.GetNodePools(manager.clusterClient, opts.ClusterName).Extract()
 	if err != nil {
 		klog.Fatalf("failed to get node pools information of a cluster: %v\n", err)
@@ -201,8 +204,14 @@ func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.Autosca
 	// Given our current implementation just support single node pool,
 	// please make sure there is only one node pool with Autoscaling flag turned on in CCE cluster
 	var nodePoolsWithAutoscalingEnabled []*NodeGroup
+
+	nodeGroupNames := getNodeGroupNameFromSpec(do.NodeGroupSpecs)
 	for _, nodePool := range nodePools.Items {
 		if !nodePool.Spec.Autoscaling.Enable {
+			continue
+		}
+
+		if !huaweicloudsdk.IsInStrSlice(nodeGroupNames, nodePool.Metadata.Name) {
 			continue
 		}
 
@@ -237,18 +246,23 @@ func BuildHuaweiCloud(opts config.AutoscalingOptions, do cloudprovider.NodeGroup
 		klog.Fatalf("must specify at least one node group with --nodes=<min>:<max>:<name>,...")
 	}
 
-	// TODO: Currently, only support single nodegroup (a.k.a node pool in Huawei CCE)
-	if len(do.NodeGroupSpecs) > 1 {
-		klog.Fatalf("HuaweiCloud autoscaler only supports a single nodegroup for now")
-	}
-
 	provider, err := buildhuaweicloudCloudProvider(manager, rl)
 	if err != nil {
 		klog.Fatalf("failed to create huaweicloud cloud provider: %v", err)
 	}
 
-	nodePoolsWithAutoscalingEnabled := getAutoscaleNodePools(manager, opts)
+	nodePoolsWithAutoscalingEnabled := getAutoscaleNodePools(manager, do, opts)
 	provider.(*huaweicloudCloudProvider).Append(nodePoolsWithAutoscalingEnabled)
 
 	return provider
+}
+
+func getNodeGroupNameFromSpec(specs []string) []string {
+	var nodeNames []string
+	for _, spec := range specs {
+		s, _ := dynamic.SpecFromString(spec, scaleToZeroSupported)
+		nodeNames = append(nodeNames, s.Name)
+	}
+
+	return nodeNames
 }
