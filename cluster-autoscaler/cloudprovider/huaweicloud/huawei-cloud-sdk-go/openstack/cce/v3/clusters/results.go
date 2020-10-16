@@ -81,10 +81,18 @@ type Autoscaling struct {
 	MaxNodeCount int  `json:"maxNodeCount"`
 }
 
+// NodeTemplate "nodeTemplate" section in the request body of updating a node pool
+type NodeTemplate struct {
+	Flavor string `json:"flavor"`
+	Az string `json:"az"`
+	Os string `json:"os"`
+}
+
 // Spec "spec" section in the request body of updating a node pool
 type Spec struct {
 	InitialNodeCount int         `json:"initialNodeCount"`
 	Autoscaling      Autoscaling `json:"autoscaling"`
+	NodeTemplate     NodeTemplate `json:"nodeTemplate"`
 }
 
 // NodePoolStatus "status" section of a node pool
@@ -145,6 +153,30 @@ func (r GetCCENodePoolsResult) Extract() (NodePools, error) {
 // DeleteNodeResult is the error section in the result of deleting a node.
 type DeleteNodeResult struct {
 	huaweicloudsdk.ErrResult
+}
+
+// GetCCENodePoolResult for NodePools
+type GetCCENodePoolResult struct {
+	huaweicloudsdk.Result
+}
+
+// GetCCENodeResult for Node
+type GetCCENodeResult struct {
+	huaweicloudsdk.Result
+}
+
+// Extract node and error
+func (r GetCCENodeResult) Extract() (CCENode, error) {
+	var res CCENode
+	err := r.ExtractInto(&res)
+	return res, err
+}
+
+// Extract node pool and error
+func (r GetCCENodePoolResult) Extract() (NodePool, error) {
+	var res NodePool
+	err := r.ExtractInto(&res)
+	return res, err
 }
 
 // ToClustersUpdateMap is a method that has to be implemented by RequestBody for interface UpdateOptsBuilder.

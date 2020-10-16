@@ -36,6 +36,13 @@ func GetNodePools(client *huaweicloudsdk.ServiceClient, clusterId string) (r Get
 	return
 }
 
+// GetNodePool calls CCE REST API to get the information of one node pool by id.
+func GetNodePool(client *huaweicloudsdk.ServiceClient, clusterId, nodePoolId string) (r GetCCENodePoolResult) {
+	nodePoolURL := getNodePoolURL(client, clusterId, nodePoolId)
+	_, r.Err = client.Get(nodePoolURL, &r.Body, nil)
+	return
+}
+
 // DeleteNode calls CCE REST API to delete a node with UID of nodeId in a designated cluster.
 func DeleteNode(client *huaweicloudsdk.ServiceClient, clusterId string, nodeId string) (r DeleteNodeResult) {
 	deleteNodeURL := deleteNodeURL(client, clusterId, nodeId)

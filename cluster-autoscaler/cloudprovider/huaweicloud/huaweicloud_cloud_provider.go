@@ -46,7 +46,7 @@ var (
 type huaweicloudCloudProvider struct {
 	huaweiCloudManager *huaweicloudCloudManager
 	resourceLimiter    *cloudprovider.ResourceLimiter
-	nodeGroups         []NodeGroup
+	nodeGroups         []*NodeGroup
 }
 
 // Name returns the name of the cloud provider.
@@ -56,21 +56,21 @@ func (hcp *huaweicloudCloudProvider) Name() string {
 
 // NodeGroups returns all node groups managed by this cloud provider.
 func (hcp *huaweicloudCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
-	groups := make([]cloudprovider.NodeGroup, len(hcp.nodeGroups))
-	for i, group := range hcp.nodeGroups {
-		groups[i] = &group
+	results := make([]cloudprovider.NodeGroup, 0, len(hcp.nodeGroups))
+	for _, group := range hcp.nodeGroups {
+		results = append(results, group)
 	}
-	return groups
+	return results
 }
 
 // NodeGroupForNode returns the node group that a given node belongs to.
 // Since only a single node group is currently supported in huaweicloudprovider, the first node group is always returned.
 func (hcp *huaweicloudCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
-	// currently there is ONLY one nodegroup
-	if _, found := node.ObjectMeta.Labels["node-role.kubernetes.io/master"]; found {
+	if poolName, found := node.ObjectMeta.Labels["cce.cloud.com/cce-nodepool"]; !found {
 		return nil, nil
+	} else {
+		return hcp.findNodeGroup(poolName)
 	}
-	return &(hcp.nodeGroups[0]), nil
 }
 
 // Pricing returns pricing model for this cloud provider or error if not available. Not implemented.
@@ -121,7 +121,7 @@ func (hcp *huaweicloudCloudProvider) Refresh() error {
 }
 
 // Append appends a node group to the list of node groups managed by this cloud provider.
-func (hcp *huaweicloudCloudProvider) Append(group []NodeGroup) {
+func (hcp *huaweicloudCloudProvider) Append(group []*NodeGroup) {
 	hcp.nodeGroups = append(hcp.nodeGroups, group...) // append slice to another
 }
 
@@ -130,12 +130,24 @@ func (hcp *huaweicloudCloudProvider) GetInstanceID(node *apiv1.Node) string {
 	return node.Spec.ProviderID
 }
 
+// findNodeGroup returns NodeGroup of a specified node pool
+func (hcp *huaweicloudCloudProvider)findNodeGroup(nodePoolName string) (*NodeGroup, error) {
+	for _, ng := range hcp.nodeGroups {
+		if nodePoolName != ng.nodePoolName {
+			continue
+		}
+		return ng, nil
+	}
+	return nil, nil
+}
+
 // buildhuaweicloudCloudProvider returns a new instance of type huaweicloudCloudProvider.
 func buildhuaweicloudCloudProvider(huaweiCloudManager *huaweicloudCloudManager, resourceLimiter *cloudprovider.ResourceLimiter) (cloudprovider.CloudProvider, error) {
+	asg := make([]*NodeGroup, 0)
 	hcp := &huaweicloudCloudProvider{
 		huaweiCloudManager: huaweiCloudManager,
 		resourceLimiter:    resourceLimiter,
-		nodeGroups:         []NodeGroup{},
+		nodeGroups:         asg,
 	}
 	return hcp, nil
 }
@@ -178,7 +190,7 @@ func buildHuaweiCloudManager(opts config.AutoscalingOptions, do cloudprovider.No
 }
 
 // getAutoscaleNodePools returns a slice of NodeGroup with Autoscaler label enabled.
-func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.AutoscalingOptions) *[]NodeGroup {
+func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.AutoscalingOptions) []*NodeGroup {
 	nodePools, err := clusters.GetNodePools(manager.clusterClient, opts.ClusterName).Extract()
 	if err != nil {
 		klog.Fatalf("failed to get node pools information of a cluster: %v\n", err)
@@ -188,7 +200,7 @@ func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.Autosca
 
 	// Given our current implementation just support single node pool,
 	// please make sure there is only one node pool with Autoscaling flag turned on in CCE cluster
-	var nodePoolsWithAutoscalingEnabled []NodeGroup
+	var nodePoolsWithAutoscalingEnabled []*NodeGroup
 	for _, nodePool := range nodePools.Items {
 		if !nodePool.Spec.Autoscaling.Enable {
 			continue
@@ -197,7 +209,7 @@ func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.Autosca
 		klog.V(4).Infof("adding node pool: %q, name: %s, min: %d, max: %d",
 			nodePool.Metadata.Uid, nodePool.Metadata.Name, nodePool.Spec.Autoscaling.MinNodeCount, nodePool.Spec.Autoscaling.MaxNodeCount)
 
-		nodePoolsWithAutoscalingEnabled = append(nodePoolsWithAutoscalingEnabled, NodeGroup{
+		nodePoolsWithAutoscalingEnabled = append(nodePoolsWithAutoscalingEnabled, &NodeGroup{
 			huaweiCloudManager: manager,
 			clusterUpdateMutex: &clusterUpdateLock,
 			nodePoolName:       nodePool.Metadata.Name,
@@ -213,7 +225,7 @@ func getAutoscaleNodePools(manager *huaweicloudCloudManager, opts config.Autosca
 	if len(nodePoolsWithAutoscalingEnabled) == 0 {
 		klog.V(4).Info("cluster-autoscaler is disabled Because no node pools has Autoscaling enabled in CCE cluster")
 	}
-	return &nodePoolsWithAutoscalingEnabled
+	return nodePoolsWithAutoscalingEnabled
 }
 
 // BuildHuaweiCloud is called by the autoscaler/cluster-autoscaler/builder to build a huaweicloud cloud provider.
@@ -236,7 +248,7 @@ func BuildHuaweiCloud(opts config.AutoscalingOptions, do cloudprovider.NodeGroup
 	}
 
 	nodePoolsWithAutoscalingEnabled := getAutoscaleNodePools(manager, opts)
-	provider.(*huaweicloudCloudProvider).Append(*nodePoolsWithAutoscalingEnabled)
+	provider.(*huaweicloudCloudProvider).Append(nodePoolsWithAutoscalingEnabled)
 
 	return provider
 }

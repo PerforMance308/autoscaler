@@ -21,11 +21,17 @@ import (
 	"github.com/pkg/errors"
 	"gopkg.in/gcfg.v1"
 	"io"
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go/openstack"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go/openstack/cce/v3/clusters"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/autoscaler/cluster-autoscaler/version"
+	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
+	"math/rand"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"time"
@@ -70,6 +76,13 @@ type huaweicloudCloudManager struct {
 	clusterClient *huaweicloudsdk.ServiceClient
 	clusterName   string // this is the id of the cluster
 	timeIncrement time.Duration
+}
+
+type asgTemplate struct {
+	InstanceType *instanceType
+	Region       string
+	Zone         string
+	Tags         map[string]string
 }
 
 func buildManager(configReader io.Reader, discoverOpts cloudprovider.NodeGroupDiscoveryOptions, opts config.AutoscalingOptions) (*huaweicloudCloudManager, error) {
@@ -282,4 +295,67 @@ func (mgr *huaweicloudCloudManager) canUpdate() (bool, string, error) {
 		return false, "", fmt.Errorf("could not get cluster status: %v", err)
 	}
 	return !availableStatuses.Has(clusterStatus), clusterStatus, nil
+}
+
+//
+func (mgr *huaweicloudCloudManager) getAsgTemplate(ng *NodeGroup) (*asgTemplate, error) {
+	nodePool, err := clusters.GetNodePool(mgr.clusterClient, mgr.clusterName, ng.nodePoolId).Extract()
+	if err != nil {
+		return nil, nil
+	}
+
+	instanceType := buildInstanceType(nodePool)
+
+	return &asgTemplate{
+		InstanceType: instanceType,
+		Region: "cn-north-4",
+		Zone: nodePool.Spec.NodeTemplate.Az,
+	}, nil
+}
+
+func (mgr *huaweicloudCloudManager) buildNodeFromTemplate(ng *NodeGroup, template *asgTemplate) (*apiv1.Node, error) {
+	node := apiv1.Node{}
+	nodeName := fmt.Sprintf("%s-asg-%d", ng.nodePoolName, rand.Int63())
+
+	node.ObjectMeta = metav1.ObjectMeta{
+		Name:     nodeName,
+		SelfLink: fmt.Sprintf("/api/v1/nodes/%s", nodeName),
+		Labels:   map[string]string{},
+	}
+
+	node.Status = apiv1.NodeStatus{
+		Capacity: apiv1.ResourceList{},
+	}
+
+	// TODO: get a real value.
+	node.Status.Capacity[apiv1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewQuantity(template.InstanceType.CPU, resource.DecimalSI)
+	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.InstanceType.MemoryInGB*1024*1024*1024, resource.DecimalSI)
+
+	node.Status.Allocatable = node.Status.Capacity
+
+	node.Labels = cloudprovider.JoinStringMaps(node.Labels, buildGenericLabels(template, nodeName))
+
+	node.Status.Conditions = cloudprovider.BuildReadyConditions()
+	return &node, nil
+}
+
+func buildGenericLabels(template *asgTemplate, nodeName string) map[string]string {
+	result := make(map[string]string)
+	result[kubeletapis.LabelArch] = cloudprovider.DefaultArch
+	result[kubeletapis.LabelOS] = cloudprovider.DefaultOS
+
+	result[apiv1.LabelInstanceType] = template.InstanceType.InstanceTypeID
+
+	result[apiv1.LabelZoneRegion] = template.Region
+	result[apiv1.LabelZoneFailureDomain] = template.Zone
+	result[apiv1.LabelHostname] = nodeName
+
+	// append custom node labels
+	for key, value := range template.Tags {
+		result[key] = value
+	}
+
+	return result
 }

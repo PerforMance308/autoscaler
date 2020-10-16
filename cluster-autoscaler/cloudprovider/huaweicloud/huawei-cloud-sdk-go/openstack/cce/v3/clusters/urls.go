@@ -42,6 +42,15 @@ func getNodePoolsURL(sc *huaweicloudsdk.ServiceClient, clusterID string) string 
 	return sc.ServiceURL(clusterDenoter, clusterID, nodepoolDenoter)
 }
 
+// getNodePoolsURL returns a URL for getting the information of one nodepool attached to a cce cluster with designated clusterID and nodePoolId.
+// REST API:
+//		GET /api/v3/projects/{project_id}/clusters/{cluster_id}/nodepools/{nodepool_id}
+// Example:
+// 		https://cce.cn-north-4.myhuaweicloud.com/api/v3/projects/9071a38e7f6a4ba7b7bcbeb7d4ea6efc/clusters/25b884ab-623f-11ea-9981-0255ac101546/nodepools/06867c9a-0e54-11eb-a269-0255ac101d64
+func getNodePoolURL(sc *huaweicloudsdk.ServiceClient, clusterID, nodePoolID string) string {
+	return sc.ServiceURL(clusterDenoter, clusterID, nodepoolDenoter, nodePoolID)
+}
+
 // deleteNodeURL returns a URL for deleting a node with uid of nodeId in a cce cluster with clusterID.
 // REST API:
 // 		DELETE /api/v3/projects/{project_id}/clusters/{cluster_id}/nodes/{node_id}

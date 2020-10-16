@@ -289,7 +289,17 @@ func (ng *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 // capacity and allocatable information as well as all pods that are started on
 // the node by default, using manifest (most likely only kube-proxy). Not implemented
 func (ng *NodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	template, err := ng.huaweiCloudManager.getAsgTemplate(ng)
+	if err != nil {
+		return nil, err
+	}
+	node, err := ng.huaweiCloudManager.buildNodeFromTemplate(ng, template)
+	if err != nil {
+		return nil, err
+	}
+	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(ng.nodePoolName))
+	nodeInfo.SetNode(node)
+	return nodeInfo, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side. Currently always returns true.
