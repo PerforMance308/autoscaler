@@ -151,17 +151,12 @@ func buildManager(configReader io.Reader, discoverOpts cloudprovider.NodeGroupDi
 }
 
 // nodeGroupSize gets the size of the node pool with the name of nodeGroupName attached to current cluster.
-func (mgr *huaweicloudCloudManager) nodeGroupSize(nodeGroupName string) (int, error) {
-	nodePools, err := clusters.GetNodePools(mgr.clusterClient, mgr.clusterName).Extract()
+func (mgr *huaweicloudCloudManager) nodeGroupSize(nodePoolId string) (int, error) {
+	nodePool, err := clusters.GetNodePool(mgr.clusterClient, mgr.clusterName, nodePoolId).Extract()
 	if err != nil {
-		return 0, fmt.Errorf("could not retrieve node pools from CCE cluster: %v", err)
+		return 0, fmt.Errorf("could not retrieve node pool from CCE cluster by node pool id: %v", err)
 	}
-	for _, nodePool := range nodePools.Items {
-		if nodePool.Metadata.Name == nodeGroupName {
-			return nodePool.NodePoolStatus.CurrentNode, nil
-		}
-	}
-	return 0, fmt.Errorf("could not find node pool with given name: %v", err)
+	return nodePool.NodePoolStatus.CurrentNode, nil
 }
 
 /*

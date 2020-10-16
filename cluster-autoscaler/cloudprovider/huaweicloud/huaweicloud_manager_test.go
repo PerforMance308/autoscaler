@@ -228,7 +228,7 @@ func Test_nodeGroupSize(t *testing.T) {
 
 	manager := createTestHuaweicloudManager()
 
-	nodeCount, err := manager.nodeGroupSize(nodePoolName)
+	nodeCount, err := manager.nodeGroupSize(nodePoolUID)
 	assert.NoError(t, err)
 	assert.Equal(t, nodePoolNodeCount, nodeCount)
 }

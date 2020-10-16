@@ -94,7 +94,7 @@ func (ng *NodeGroup) IncreaseSize(delta int) error {
 		return fmt.Errorf("delta for increasing size should be positive")
 	}
 
-	currentSize, err := ng.huaweiCloudManager.nodeGroupSize(ng.nodePoolName)
+	currentSize, err := ng.huaweiCloudManager.nodeGroupSize(ng.nodePoolId)
 	if err != nil {
 		return fmt.Errorf("failed to get the size of the node pool: %v", err)
 	}
@@ -167,7 +167,7 @@ func (ng *NodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	}
 
 	// update ng.targetSize
-	newSize, err := ng.huaweiCloudManager.nodeGroupSize(ng.nodePoolName)
+	newSize, err := ng.huaweiCloudManager.nodeGroupSize(ng.nodePoolId)
 	if err != nil {
 		*ng.targetSize = currentSize - len(nodes)
 		return fmt.Errorf("failed to get node pool's size after deleting the nodes: %v", err)
@@ -186,7 +186,7 @@ func checkAndUpdate(ng *NodeGroup, nodes []*apiv1.Node) (int, error) {
 	var currentSize int
 	var err error
 	if time.Since(ng.getNodePoolSizeTime) > updateWaitTime {
-		currentSize, err = ng.huaweiCloudManager.nodeGroupSize(ng.nodePoolName)
+		currentSize, err = ng.huaweiCloudManager.nodeGroupSize(ng.nodePoolId)
 		if err != nil {
 			return 0, fmt.Errorf("failed to get current node pool's size: %v", err)
 		}
