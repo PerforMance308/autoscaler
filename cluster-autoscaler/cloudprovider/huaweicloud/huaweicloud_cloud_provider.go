@@ -17,15 +17,19 @@ limitations under the License.
 package huaweicloud
 
 import (
+	"context"
 	"io"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	huaweicloudsdk "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huawei-cloud-sdk-go/openstack/cce/v3/clusters"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	klog "k8s.io/klog/v2"
 	"os"
 	"sync"
@@ -63,6 +67,7 @@ func (hcp *huaweicloudCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	for _, group := range hcp.nodeGroups {
 		results = append(results, group)
 	}
+
 	return results
 }
 
@@ -252,9 +257,53 @@ func BuildHuaweiCloud(opts config.AutoscalingOptions, do cloudprovider.NodeGroup
 	}
 
 	nodePoolsWithAutoscalingEnabled := getAutoscaleNodePools(manager, do, opts)
+	refreshConfigMap(nodePoolsWithAutoscalingEnabled)
 	provider.(*huaweicloudCloudProvider).Append(nodePoolsWithAutoscalingEnabled)
 
 	return provider
+}
+
+func refreshConfigMap(nodeGroups []*NodeGroup) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		klog.Infof("test create in cluster config failed, %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		klog.Infof("test create in cluster config failed, %v", err)
+	}
+
+	uiProperties := `
+5:
+  - ".*t2\\.micro.*"
+10: 
+  - ".*t2\\.large.*"
+  - ".*t3\\.large.*"
+50: 
+  - ".*m4\\.4xlarge.*"
+`
+	configMapData := make(map[string]string, 0)
+	configMapData["priorities"] = uiProperties
+	maps := clientset.CoreV1().ConfigMaps("kube-system")
+	cms := &apiv1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-autoscaler-priority-expander",
+			Namespace: "kube-system",
+		},
+		Data: configMapData,
+	}
+
+	cm, err := maps.Create(context.TODO(), cms, metav1.CreateOptions{})
+	klog.Infof("new configmap, %v", cm)
+
+	ncm, err := maps.Get(context.TODO(), "cluster-autoscaler-priority-expander", metav1.GetOptions{})
+
+	klog.Infof("new configmap111, %v", ncm)
 }
 
 func getNodeGroupNameFromSpec(specs []string) []string {

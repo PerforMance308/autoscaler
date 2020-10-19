@@ -74,6 +74,7 @@ var availableStatuses = sets.NewString(
 
 type huaweicloudCloudManager struct {
 	clusterClient *huaweicloudsdk.ServiceClient
+	ecsClient 	  *huaweicloudsdk.ServiceClient
 	clusterName   string // this is the id of the cluster
 	timeIncrement time.Duration
 }
@@ -125,8 +126,16 @@ func buildManager(configReader io.Reader, discoverOpts cloudprovider.NodeGroupDi
 		return nil, clientErr
 	}
 
+	// create Huawei ECS Client
+	ecsClient, clientErr := openstack.NewECSV1(provider, huaweicloudsdk.EndpointOpts{})
+	if clientErr != nil {
+		fmt.Println("Failed to get the CCEV3 client: ", clientErr)
+		return nil, clientErr
+	}
+
 	manager := huaweicloudCloudManager{
 		clusterClient: clusterClient,
+		ecsClient: ecsClient,
 		clusterName:   opts.ClusterName,
 		timeIncrement: waitForStatusTimeIncrement,
 	}
@@ -299,7 +308,7 @@ func (mgr *huaweicloudCloudManager) getAsgTemplate(ng *NodeGroup) (*asgTemplate,
 		return nil, nil
 	}
 
-	instanceType := buildInstanceType(nodePool)
+	instanceType := buildInstanceType(mgr, nodePool)
 
 	return &asgTemplate{
 		InstanceType: instanceType,
@@ -326,7 +335,7 @@ func (mgr *huaweicloudCloudManager) buildNodeFromTemplate(ng *NodeGroup, templat
 	node.Status.Capacity[apiv1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
 	node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewQuantity(template.InstanceType.CPU, resource.DecimalSI)
 	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
-	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.InstanceType.MemoryInGB*1024*1024*1024, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.InstanceType.MemoryMB*1024*1024, resource.DecimalSI)
 
 	node.Status.Allocatable = node.Status.Capacity
 

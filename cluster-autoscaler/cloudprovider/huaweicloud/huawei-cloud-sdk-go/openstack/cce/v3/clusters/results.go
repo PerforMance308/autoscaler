@@ -155,7 +155,7 @@ type DeleteNodeResult struct {
 	huaweicloudsdk.ErrResult
 }
 
-// GetCCENodePoolResult for NodePools
+// GetCCENodePoolResult for NodePool
 type GetCCENodePoolResult struct {
 	huaweicloudsdk.Result
 }
