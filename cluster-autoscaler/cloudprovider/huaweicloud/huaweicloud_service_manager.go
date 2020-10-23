@@ -51,7 +51,7 @@ type AutoScalingService interface {
 	// IncreaseSizeInstance increases the instance number of specific auto scaling group.
 	// The delta should be non-negative.
 	// IncreaseSizeInstance wait until instance number is updated.
-	IncreaseSizeInstance(groupID string, delta int) error
+	IncreaseSizeInstance(asg *AutoScalingGroup, delta int) error
 }
 
 // CloudServiceManager represents the cloud service interfaces.
@@ -138,9 +138,26 @@ func (csm *cloudServiceManager) DeleteServers(serverIDs []string) error {
 }
 
 func (csm *cloudServiceManager) GetDesireInstanceNumber(groupID string) (int, error) {
-	// TODO(RainbowMango) finish implementation later
+	asClient := csm.getASClientFunc()
+	if asClient == nil {
+		return 0, fmt.Errorf("failed to get desire instance number due to can not get as client")
+	}
 
-	return 0, nil
+	opts := &huaweicloudsdkasmodel.ShowScalingGroupRequest{
+		ScalingGroupId: groupID,
+	}
+	response, err := asClient.ShowScalingGroup(opts)
+	if err != nil {
+		klog.Errorf("failed to show scaling group info. group: %s, error: %v", groupID, err)
+		return 0, err
+	}
+
+	if response == nil || response.ScalingGroup == nil {
+		klog.Infof("no scaling group found: %s", groupID)
+		return 0, nil
+	}
+
+	return int(*response.ScalingGroup.DesireInstanceNumber), nil
 }
 
 func (csm *cloudServiceManager) GetInstances(groupID string) ([]cloudprovider.Instance, error) {
@@ -176,8 +193,35 @@ func (csm *cloudServiceManager) GetInstances(groupID string) ([]cloudprovider.In
 	return instances, nil
 }
 
-func (csm *cloudServiceManager) IncreaseSizeInstance(groupID string, delta int) error {
-	// TODO(RainbowMango) finish implementation later
+func (csm *cloudServiceManager) IncreaseSizeInstance(asg *AutoScalingGroup, delta int) error {
+	asClient := csm.getASClientFunc()
+	if asClient == nil {
+		return fmt.Errorf("failed to increase scaling groups size due to can not get as client")
+	}
+
+	desireNum, err := csm.GetDesireInstanceNumber(asg.groupID)
+	if err != nil {
+		return err
+	}
+
+	newNum := int32(desireNum + delta)
+	if int(newNum) > asg.maxInstanceNumber || int(newNum) < 0 {
+		return fmt.Errorf("failed to increase scaling groups size reach limit")
+	}
+
+	opts := &huaweicloudsdkasmodel.UpdateScalingGroupRequest{
+		ScalingGroupId: asg.groupID,
+		Body: &huaweicloudsdkasmodel.UpdateScalingGroupRequestBody{
+			DesireInstanceNumber: &newNum,
+		},
+	}
+
+	_, err = asClient.UpdateScalingGroup(opts)
+	if err != nil {
+		klog.Errorf("failed to update scaling group. group: %s, error: %v", asg.groupID, err)
+		return err
+	}
+
 	return nil
 }
 

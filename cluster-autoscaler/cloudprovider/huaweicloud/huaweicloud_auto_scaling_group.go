@@ -79,7 +79,7 @@ func (asg *AutoScalingGroup) TargetSize() (int, error) {
 // to explicitly name it and use DeleteNode. This function should wait until
 // node group size is updated. Implementation required.
 func (asg *AutoScalingGroup) IncreaseSize(delta int) error {
-	err := asg.cloudServiceManager.IncreaseSizeInstance(asg.groupID, delta)
+	err := asg.cloudServiceManager.IncreaseSizeInstance(asg, delta)
 	if err != nil {
 		klog.Warningf("failed to increase size for group: %s, error: %v", asg.groupID, err)
 		return err
