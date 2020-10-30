@@ -18,15 +18,22 @@ package huaweicloud
 
 import (
 	"fmt"
+	"math/rand"
+	"strings"
 	"time"
 
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	huaweicloudsdkas "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/as/v1"
 	huaweicloudsdkasmodel "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/as/v1/model"
 	huaweicloudsdkecs "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/ecs/v2"
 	huaweicloudsdkecsmodel "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/ecs/v2/model"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/klog/v2"
+	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 )
 
 // ElasticCloudServerService represents the elastic cloud server interfaces.
@@ -34,6 +41,8 @@ import (
 type ElasticCloudServerService interface {
 	// DeleteServers deletes a group of server by ID.
 	DeleteServers(serverIDs []string) error
+	// List all instance type by availablity zone
+	ListFlavors(az string) ([]*InstanceType, error)
 }
 
 // AutoScalingService represents the auto scaling service interfaces.
@@ -52,6 +61,17 @@ type AutoScalingService interface {
 	// The delta should be non-negative.
 	// IncreaseSizeInstance wait until instance number is updated.
 	IncreaseSizeInstance(asg *AutoScalingGroup, delta int) error
+
+	// ShowAsgConfig returns auto scaling group config
+	ShowAsgConfig(cfgID string) (*AutoScalingGroupConfig, error)
+}
+
+type internalService interface {
+	// Get default auto scaling group template
+	getAsgTemplate(groupID string) (*asgTemplate, error)
+
+	// buildNodeFromTemplate returns template from instance flavor
+	buildNodeFromTemplate(asgName string, template *asgTemplate) (*apiv1.Node, error)
 }
 
 // CloudServiceManager represents the cloud service interfaces.
@@ -62,12 +82,22 @@ type CloudServiceManager interface {
 
 	// AutoScalingService represents the auto scaling service interfaces.
 	AutoScalingService
+
+	// internalService is used for internal use only
+	internalService
 }
 
 type cloudServiceManager struct {
 	cloudConfig      *CloudConfig
 	getECSClientFunc func() *huaweicloudsdkecs.EcsClient
 	getASClientFunc  func() *huaweicloudsdkas.AsClient
+}
+
+type asgTemplate struct {
+	InstanceType *InstanceType
+	Region       string
+	Zone         string
+	Tags         map[string]string
 }
 
 func newCloudServiceManager(cloudConfig *CloudConfig) *cloudServiceManager {
@@ -180,9 +210,12 @@ func (csm *cloudServiceManager) GetInstances(groupID string) ([]cloudprovider.In
 		klog.Infof("no instance in scaling group: %s", groupID)
 		return nil, nil
 	}
-
 	instances := make([]cloudprovider.Instance, 0, len(*response.ScalingGroupInstances))
 	for _, sgi := range *response.ScalingGroupInstances {
+		if sgi.InstanceId == nil {
+			continue
+		}
+
 		instance := cloudprovider.Instance{
 			Id:     *sgi.InstanceId,
 			Status: csm.transformInstanceState(*sgi.LifeCycleState, *sgi.HealthStatus),
@@ -256,6 +289,121 @@ func (csm *cloudServiceManager) ListScalingGroups() ([]AutoScalingGroup, error) 
 	return autoScalingGroups, nil
 }
 
+func (csm *cloudServiceManager) ListFlavors(az string) ([]*InstanceType, error) {
+	ecsClient := csm.getECSClientFunc()
+	if ecsClient == nil {
+		return nil, fmt.Errorf("failed to list instance flavors due to can not get ecs client")
+	}
+
+	opts := &huaweicloudsdkecsmodel.ListFlavorsRequest{
+		AvailabilityZone: &az,
+	}
+	response, err := ecsClient.ListFlavors(opts)
+	if err != nil {
+		klog.Errorf("failed to list flavors. availability zone: %s", az)
+		return nil, err
+	}
+
+	instanceTypes := make([]*InstanceType, 0, len(*response.Flavors))
+	for _, flavor := range *response.Flavors {
+		instanceType := newInstanceType(&flavor)
+		instanceTypes = append(instanceTypes, instanceType)
+	}
+	return instanceTypes, nil
+}
+
+func (csm *cloudServiceManager) ShowAsgConfig(cfgID string) (*AutoScalingGroupConfig, error) {
+	asClient := csm.getASClientFunc()
+	if asClient == nil {
+		return nil, fmt.Errorf("failed to get auto scaling config due to can not get as client")
+	}
+
+	opts := &huaweicloudsdkasmodel.ShowScalingConfigRequest{
+		ScalingConfigurationId: cfgID,
+	}
+	response, err := asClient.ShowScalingConfig(opts)
+	if err != nil {
+		klog.Errorf("failed to show scaling group config. config id: %s, error: %v", cfgID, err)
+		return nil, err
+	}
+	return newAutoScalingGroupConfig(response.ScalingConfiguration), nil
+}
+
+func (csm *cloudServiceManager) getAsgTemplate(groupID string) (*asgTemplate, error) {
+	asClient := csm.getASClientFunc()
+	if asClient == nil {
+		return nil, fmt.Errorf("failed to get desire instance number due to can not get as client")
+	}
+
+	opts := &huaweicloudsdkasmodel.ShowScalingGroupRequest{
+		ScalingGroupId: groupID,
+	}
+	response, err := asClient.ShowScalingGroup(opts)
+	if err != nil {
+		klog.Errorf("failed to show scaling group info. group: %s, error: %v", groupID, err)
+		return nil, err
+	}
+
+	if response == nil || response.ScalingGroup == nil {
+		klog.Infof("no scaling group found: %s", groupID)
+		return nil, nil
+	}
+
+	autoScalingConfig, err := csm.ShowAsgConfig(*response.ScalingGroup.ScalingConfigurationId)
+	if err != nil {
+		klog.Errorf("failed to show scaling group config. group: %s, error: %v", groupID, err)
+		return nil, err
+	}
+
+	for _, az := range *response.ScalingGroup.AvailableZones {
+		flavors, err := csm.ListFlavors(az)
+		if err != nil {
+			klog.Errorf("failed to list flavors, available zone is: %s, error: %v", az, err)
+			return nil, err
+		}
+
+		for _, flavor := range flavors {
+			if !strings.EqualFold(flavor.Name, autoScalingConfig.flavorRef) {
+				continue
+			}
+			return &asgTemplate{
+				InstanceType: flavor,
+				Zone:         az,
+			}, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (csm *cloudServiceManager) buildNodeFromTemplate(asgName string, template *asgTemplate) (*apiv1.Node, error) {
+	node := apiv1.Node{}
+	nodeName := fmt.Sprintf("%s-asg-%d", asgName, rand.Int63())
+
+	node.ObjectMeta = metav1.ObjectMeta{
+		Name:     nodeName,
+		SelfLink: fmt.Sprintf("/api/v1/nodes/%s", nodeName),
+		Labels:   map[string]string{},
+	}
+
+	node.Status = apiv1.NodeStatus{
+		Capacity: apiv1.ResourceList{},
+	}
+
+	// TODO: get a real value.
+	node.Status.Capacity[apiv1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewQuantity(template.InstanceType.VCPU, resource.DecimalSI)
+	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.InstanceType.RAM*1024*1024, resource.DecimalSI)
+
+	node.Status.Allocatable = node.Status.Capacity
+
+	node.Labels = cloudprovider.JoinStringMaps(node.Labels, buildGenericLabels(template, nodeName))
+
+	node.Status.Conditions = cloudprovider.BuildReadyConditions()
+	return &node, nil
+}
+
 func (csm *cloudServiceManager) transformInstanceState(lifeCycleState huaweicloudsdkasmodel.ScalingGroupInstanceLifeCycleState,
 	healthStatus huaweicloudsdkasmodel.ScalingGroupInstanceHealthStatus) *cloudprovider.InstanceStatus {
 	instanceStatus := &cloudprovider.InstanceStatus{}
@@ -299,4 +447,23 @@ func (csm *cloudServiceManager) transformInstanceState(lifeCycleState huaweiclou
 	}
 
 	return instanceStatus
+}
+
+func buildGenericLabels(template *asgTemplate, nodeName string) map[string]string {
+	result := make(map[string]string)
+	result[kubeletapis.LabelArch] = cloudprovider.DefaultArch
+	result[kubeletapis.LabelOS] = cloudprovider.DefaultOS
+
+	result[apiv1.LabelInstanceType] = template.InstanceType.Name
+
+	result[apiv1.LabelZoneRegion] = template.Region
+	result[apiv1.LabelZoneFailureDomain] = template.Zone
+	result[apiv1.LabelHostname] = nodeName
+
+	// append custom node labels
+	for key, value := range template.Tags {
+		result[key] = value
+	}
+
+	return result
 }

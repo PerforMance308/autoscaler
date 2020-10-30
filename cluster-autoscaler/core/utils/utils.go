@@ -122,7 +122,6 @@ func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedu
 		}
 		result[id] = nodeInfo
 	}
-
 	// Remove invalid node groups from cache
 	for id := range nodeInfoCache {
 		if _, ok := seenGroups[id]; !ok {
@@ -148,7 +147,6 @@ func GetNodeInfosForGroups(nodes []*apiv1.Node, nodeInfoCache map[string]*schedu
 			}
 		}
 	}
-
 	return result, nil
 }
 

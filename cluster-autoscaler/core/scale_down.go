@@ -818,7 +818,6 @@ func (sd *ScaleDown) TryToScaleDown(
 			sd.addUnremovableNodeReason(node, simulator.NotUnreadyLongEnough)
 			continue
 		}
-
 		nodeGroup, err := sd.context.CloudProvider.NodeGroupForNode(node)
 		if err != nil {
 			klog.Errorf("Error while checking node group for %s: %v", node.Name, err)

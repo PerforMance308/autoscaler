@@ -97,8 +97,6 @@ func (asg *AutoScalingGroup) DeleteNodes(nodes []*apiv1.Node) error {
 		klog.Warningf("failed to get nodes from group: %s, error: %v", asg.groupID, err)
 		return err
 	}
-
-	// TODO(RainbowMango): Check if all node in this group.
 	//  If one of the node is not belong to this group, just return error.
 
 	servers := make([]string, 0, len(instances))
@@ -112,6 +110,11 @@ func (asg *AutoScalingGroup) DeleteNodes(nodes []*apiv1.Node) error {
 		return err
 	}
 
+	err = asg.DecreaseTargetSize(len(nodes))
+	if err != nil {
+		klog.Warningf("failed to decrease group size. error: %v", err)
+		return err
+	}
 	// TODO(RainbowMango): Wait for node group size updated.
 
 	return nil
@@ -123,8 +126,12 @@ func (asg *AutoScalingGroup) DeleteNodes(nodes []*apiv1.Node) error {
 // It is assumed that cloud provider will not delete the existing nodes when there
 // is an option to just decrease the target. Implementation required.
 func (asg *AutoScalingGroup) DecreaseTargetSize(delta int) error {
-	// TODO(RainbowMango): Just remove nodes from group not delete them?
-	return cloudprovider.ErrNotImplemented
+	err := asg.cloudServiceManager.IncreaseSizeInstance(asg, 0-delta)
+	if err != nil {
+		klog.Warningf("failed to decrease size for group: %s, error: %v", asg.groupID, err)
+		return err
+	}
+	return nil
 }
 
 // Id returns an unique identifier of the node group.
@@ -158,7 +165,17 @@ func (asg *AutoScalingGroup) Nodes() ([]cloudprovider.Instance, error) {
 // capacity and allocatable information as well as all pods that are started on
 // the node by default, using manifest (most likely only kube-proxy). Implementation optional.
 func (asg *AutoScalingGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	template, err := asg.cloudServiceManager.getAsgTemplate(asg.groupID)
+	if err != nil {
+		return nil, err
+	}
+	node, err := asg.cloudServiceManager.buildNodeFromTemplate(asg.groupName, template)
+	if err != nil {
+		return nil, err
+	}
+	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(asg.groupName))
+	nodeInfo.SetNode(node)
+	return nodeInfo, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side. Allows to tell the
