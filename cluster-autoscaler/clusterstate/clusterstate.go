@@ -968,11 +968,13 @@ func (csr *ClusterStateRegistry) getCloudProviderNodeInstances() (map[string][]c
 func getNotRegisteredNodes(allNodes []*apiv1.Node, cloudProviderNodeInstances map[string][]cloudprovider.Instance, time time.Time) []UnregisteredNode {
 	registered := sets.NewString()
 	for _, node := range allNodes {
+		klog.Infof("@@@@@ %s", node.Spec.ProviderID)
 		registered.Insert(node.Spec.ProviderID)
 	}
 	notRegistered := make([]UnregisteredNode, 0)
 	for _, instances := range cloudProviderNodeInstances {
 		for _, instance := range instances {
+			klog.Infof("!!!!!! %s", instance.Id)
 			if !registered.Has(instance.Id) {
 				notRegistered = append(notRegistered, UnregisteredNode{
 					Node:              fakeNode(instance),

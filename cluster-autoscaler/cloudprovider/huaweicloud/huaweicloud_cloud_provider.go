@@ -23,7 +23,9 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
+	huaweicloudsdkasmodel "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/as/v1/model"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/config/dynamic"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	klog "k8s.io/klog/v2"
 )
@@ -43,39 +45,70 @@ var (
 
 // huaweicloudCloudProvider implements CloudProvider interface defined in autoscaler/cluster-autoscaler/cloudprovider/cloud_provider.go
 type huaweicloudCloudProvider struct {
-	cloudServiceManager CloudServiceManager
-	resourceLimiter     *cloudprovider.ResourceLimiter
-	autoScalingGroup    []AutoScalingGroup
-	lock                sync.RWMutex
-
-	// Following to be refactored
-	huaweiCloudManager *huaweicloudCloudManager
-	nodeGroups         []NodeGroup
+	manager          *HuaweiCloudManager
+	resourceLimiter  *cloudprovider.ResourceLimiter
+	autoScalingGroup []*AutoScalingGroup
+	lock             sync.RWMutex
 }
 
-func newCloudProvider(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) *huaweicloudCloudProvider {
+func newCloudProvider(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) (*huaweicloudCloudProvider, error) {
 	cloudConfig, err := readConf(opts.CloudConfig)
 	if err != nil {
 		klog.Errorf("failed to read cloud configuration. error: %v", err)
-		return nil
+		return nil, err
 	}
 	if err = cloudConfig.validate(); err != nil {
 		klog.Errorf("cloud configuration is invalid. error: %v", err)
-		return nil
+		return nil, err
 	}
 
-	csm := newCloudServiceManager(cloudConfig)
-	sgs, err := csm.ListScalingGroups()
+	csm := newHuaweiCloudManager(cloudConfig)
+
+	hcp := &huaweicloudCloudProvider{
+		manager:          csm,
+		resourceLimiter:  rl,
+		autoScalingGroup: make([]*AutoScalingGroup, 0),
+	}
+
+	asgs, err := hcp.manager.ListAsg()
 	if err != nil {
-		klog.Errorf("failed to list scaling groups. error: %v", err)
-		return nil
+		klog.Warning("failed to list scaling group to huaweicloud provider")
+		return nil, err
+	}
+	for _, spec := range do.NodeGroupSpecs {
+		if err := hcp.addNodeGroup(spec, asgs); err != nil {
+			klog.Warningf("failed to add node group to huaweicloud provider with spec: %s", spec)
+			return nil, err
+		}
 	}
 
-	return &huaweicloudCloudProvider{
-		cloudServiceManager: csm,
-		resourceLimiter:     rl,
-		autoScalingGroup:    sgs,
+	return hcp, nil
+}
+
+func (hcp *huaweicloudCloudProvider) addNodeGroup(value string, asgs *[]huaweicloudsdkasmodel.ScalingGroups) error {
+	nodeSpec, err := dynamic.SpecFromString(value, true)
+
+	if err != nil {
+		return fmt.Errorf("failed to parse node group spec: %v", err)
 	}
+
+	for _, asg := range *asgs {
+		if *asg.ScalingGroupName == nodeSpec.Name {
+			asg, err := buildAsgFromSpec(*asg.ScalingGroupId, hcp.manager, asgs)
+			if err != nil {
+				klog.Errorf("failed to build ASG from spec,because of %s", err.Error())
+				return err
+			}
+			hcp.addAsg(asg)
+		}
+	}
+
+	return nil
+}
+
+func (hcp *huaweicloudCloudProvider) addAsg(asg *AutoScalingGroup) {
+	hcp.autoScalingGroup = append(hcp.autoScalingGroup, asg)
+	hcp.manager.RegisterAsg(asg)
 }
 
 // Name returns the name of the cloud provider.
@@ -85,13 +118,9 @@ func (hcp *huaweicloudCloudProvider) Name() string {
 
 // NodeGroups returns all node groups managed by this cloud provider.
 func (hcp *huaweicloudCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
-	hcp.lock.RLock()
-	defer hcp.lock.RUnlock()
-
 	groups := make([]cloudprovider.NodeGroup, 0, len(hcp.autoScalingGroup))
-	for i := range hcp.autoScalingGroup {
-		pinedGroup := hcp.autoScalingGroup[i]
-		groups = append(groups, &pinedGroup)
+	for _, asg := range hcp.autoScalingGroup {
+		groups = append(groups, asg)
 	}
 	return groups
 }
@@ -103,31 +132,8 @@ func (hcp *huaweicloudCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudpr
 	if _, found := node.ObjectMeta.Labels["node-role.kubernetes.io/master"]; found {
 		return nil, nil
 	}
-	instanceID := node.Spec.ProviderID
-	if len(instanceID) == 0 {
-		klog.Warningf("Node %v has no providerId", node.Name)
-		return nil, fmt.Errorf("provider id missing from node: %s", node.Name)
-	}
 
-	hcp.lock.RLock()
-	defer hcp.lock.RUnlock()
-
-	for i := range hcp.autoScalingGroup {
-		instances, err := hcp.autoScalingGroup[i].Nodes()
-		if err != nil {
-			klog.Warningf("failed to list instances from scaling group: %s, error: %v", hcp.autoScalingGroup[i].groupName, err)
-			return nil, err
-		}
-
-		for j := range instances {
-			if instanceID == instances[j].Id {
-				pinnedGroup := hcp.autoScalingGroup[i]
-				return &pinnedGroup, nil
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("no node group found")
+	return hcp.manager.GetAsgForInstance(node.Name)
 }
 
 // Pricing returns pricing model for this cloud provider or error if not available. Not implemented.
@@ -180,5 +186,28 @@ func BuildHuaweiCloud(opts config.AutoscalingOptions, do cloudprovider.NodeGroup
 		klog.Fatalf("cloud config is missing.")
 	}
 
-	return newCloudProvider(opts, do, rl)
+	hcp, err := newCloudProvider(opts, do, rl)
+
+	if err != nil {
+		klog.Errorf("failed to build huawei cloud provider, error: %v", err)
+		return nil
+	}
+	return hcp
+}
+
+func buildAsgFromSpec(groupID string, manager *HuaweiCloudManager, asgs *[]huaweicloudsdkasmodel.ScalingGroups) (*AutoScalingGroup, error) {
+	// check auto scaling group is exists or not
+	asg, err := manager.asWrapper.getScalingGroupByID(groupID)
+	if err != nil {
+		klog.Errorf("your scaling group: %s does not exist", groupID)
+		return nil, err
+	}
+
+	return &AutoScalingGroup{
+		manager:           manager,
+		groupName:         *asg.ScalingGroupName,
+		groupID:           *asg.ScalingGroupId,
+		maxInstanceNumber: int(*asg.MaxInstanceNumber),
+		minInstanceNumber: int(*asg.MinInstanceNumber),
+	}, nil
 }

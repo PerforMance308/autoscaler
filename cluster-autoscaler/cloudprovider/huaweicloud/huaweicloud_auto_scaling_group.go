@@ -28,23 +28,23 @@ import (
 
 // AutoScalingGroup represents a HuaweiCloud's 'Auto Scaling Group' which also can be treated as a node group.
 type AutoScalingGroup struct {
-	cloudServiceManager CloudServiceManager
-	groupName           string
-	groupID             string
-	minInstanceNumber   int
-	maxInstanceNumber   int
+	manager           *HuaweiCloudManager
+	groupName         string
+	groupID           string
+	minInstanceNumber int
+	maxInstanceNumber int
 }
 
 // Check if our AutoScalingGroup implements necessary interface.
 var _ cloudprovider.NodeGroup = &AutoScalingGroup{}
 
-func newAutoScalingGroup(csm CloudServiceManager, sg huaweicloudsdkasmodel.ScalingGroups) AutoScalingGroup {
+func newAutoScalingGroup(manager *HuaweiCloudManager, sg huaweicloudsdkasmodel.ScalingGroups) AutoScalingGroup {
 	return AutoScalingGroup{
-		cloudServiceManager: csm,
-		groupName:           *sg.ScalingGroupName,
-		groupID:             *sg.ScalingGroupId,
-		minInstanceNumber:   int(*sg.MinInstanceNumber),
-		maxInstanceNumber:   int(*sg.MaxInstanceNumber),
+		manager:           manager,
+		groupName:         *sg.ScalingGroupName,
+		groupID:           *sg.ScalingGroupId,
+		minInstanceNumber: int(*sg.MinInstanceNumber),
+		maxInstanceNumber: int(*sg.MaxInstanceNumber),
 	}
 }
 
@@ -66,56 +66,73 @@ func (asg *AutoScalingGroup) MinSize() int {
 // Target size is desire instance number of the auto scaling group, and not equal to current instance number if the
 // auto scaling group is in increasing or decreasing process.
 func (asg *AutoScalingGroup) TargetSize() (int, error) {
-	desireNumber, err := asg.cloudServiceManager.GetDesireInstanceNumber(asg.groupID)
+	size, err := asg.manager.GetAsgSize(asg.groupID)
 	if err != nil {
 		klog.Warningf("failed to get group target size. groupID: %s, error: %v", asg.groupID, err)
 		return 0, err
 	}
 
-	return desireNumber, nil
+	return size, nil
 }
 
 // IncreaseSize increases the size of the node group. To delete a node you need
 // to explicitly name it and use DeleteNode. This function should wait until
 // node group size is updated. Implementation required.
 func (asg *AutoScalingGroup) IncreaseSize(delta int) error {
-	err := asg.cloudServiceManager.IncreaseSizeInstance(asg, delta)
+	klog.Infof("increase ASG:%s with %d nodes", asg.Id(), delta)
+	if delta <= 0 {
+		return fmt.Errorf("size increase must be positive")
+	}
+
+	size, err := asg.manager.GetAsgSize(asg.groupID)
 	if err != nil {
-		klog.Warningf("failed to increase size for group: %s, error: %v", asg.groupID, err)
+		klog.Errorf("failed to get ASG size because of %s", err.Error())
 		return err
 	}
 
-	return nil
+	if int(size)+delta > asg.MaxSize() {
+		return fmt.Errorf("size increase is too large - desired:%d max:%d", int(size)+delta, asg.MaxSize())
+	}
+
+	return asg.manager.ScaleUpCluster(asg.groupID, size+delta)
 }
 
 // DeleteNodes deletes nodes from this node group. Error is returned either on
 // failure or if the given node doesn't belong to this node group. This function
 // should wait until node group size is updated. Implementation required.
 func (asg *AutoScalingGroup) DeleteNodes(nodes []*apiv1.Node) error {
-	instances, err := asg.cloudServiceManager.GetInstances(asg.groupID)
+	klog.Infof("dddddddddddd: %v", nodes)
+	size, err := asg.manager.GetAsgSize(asg.groupID)
+	if err != nil {
+		klog.Errorf("failed to get ASG size because of %s", err.Error())
+		return err
+	}
+
+	if int(size) <= asg.MinSize() {
+		return fmt.Errorf("min size reached, nodes will not be deleted")
+	}
+
+	instances, err := asg.manager.GetInstances(asg.groupID)
 	if err != nil {
 		klog.Warningf("failed to get nodes from group: %s, error: %v", asg.groupID, err)
 		return err
 	}
 	//  If one of the node is not belong to this group, just return error.
 
-	servers := make([]string, 0, len(instances))
+	instanceIds := make([]string, 0, len(instances))
 	for _, instance := range instances {
-		servers = append(servers, instance.Id)
+		for _, n := range nodes {
+			if n.Name == *instance.InstanceName {
+				instanceIds = append(instanceIds, *instance.InstanceId)
+			}
+		}
 	}
 
-	err = asg.cloudServiceManager.DeleteServers(servers)
+	err = asg.manager.ScaleDownCluster(asg.groupID, instanceIds)
 	if err != nil {
-		klog.Warningf("failed to delete nodes. error: %v", err)
+		klog.Warningf("failed to scale down cluster. error: %v", err)
 		return err
 	}
-
-	err = asg.DecreaseTargetSize(len(nodes))
-	if err != nil {
-		klog.Warningf("failed to decrease group size. error: %v", err)
-		return err
-	}
-	// TODO(RainbowMango): Wait for node group size updated.
 
 	return nil
 }
@@ -126,12 +143,7 @@ func (asg *AutoScalingGroup) DeleteNodes(nodes []*apiv1.Node) error {
 // It is assumed that cloud provider will not delete the existing nodes when there
 // is an option to just decrease the target. Implementation required.
 func (asg *AutoScalingGroup) DecreaseTargetSize(delta int) error {
-	err := asg.cloudServiceManager.IncreaseSizeInstance(asg, 0-delta)
-	if err != nil {
-		klog.Warningf("failed to decrease size for group: %s, error: %v", asg.groupID, err)
-		return err
-	}
-	return nil
+	return cloudprovider.ErrNotImplemented
 }
 
 // Id returns an unique identifier of the node group.
@@ -149,10 +161,15 @@ func (asg *AutoScalingGroup) Debug() string {
 // Other fields are optional.
 // This list should include also instances that might have not become a kubernetes node yet.
 func (asg *AutoScalingGroup) Nodes() ([]cloudprovider.Instance, error) {
-	instances, err := asg.cloudServiceManager.GetInstances(asg.groupID)
+	ins, err := asg.manager.GetInstances(asg.groupID)
 	if err != nil {
-		klog.Warningf("failed to get nodes from group: %s, error: %v", asg.groupID, err)
 		return nil, err
+	}
+
+	instances := make([]cloudprovider.Instance, 0, len(ins))
+	for _, instance := range ins {
+		klog.Infof("$$$$$$$$, %s,  %s", *instance.InstanceName, *instance.InstanceId)
+		instances = append(instances, cloudprovider.Instance{Id: *instance.InstanceId})
 	}
 
 	return instances, nil
@@ -165,11 +182,11 @@ func (asg *AutoScalingGroup) Nodes() ([]cloudprovider.Instance, error) {
 // capacity and allocatable information as well as all pods that are started on
 // the node by default, using manifest (most likely only kube-proxy). Implementation optional.
 func (asg *AutoScalingGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
-	template, err := asg.cloudServiceManager.getAsgTemplate(asg.groupID)
+	template, err := asg.manager.getAsgTemplate(asg.groupID)
 	if err != nil {
 		return nil, err
 	}
-	node, err := asg.cloudServiceManager.buildNodeFromTemplate(asg.groupName, template)
+	node, err := asg.manager.buildNodeFromTemplate(asg.groupName, template)
 	if err != nil {
 		return nil, err
 	}
