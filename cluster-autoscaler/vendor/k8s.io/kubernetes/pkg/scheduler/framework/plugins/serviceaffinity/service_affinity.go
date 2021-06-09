@@ -25,8 +25,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 )
 
 const (
@@ -63,7 +63,7 @@ func (s *preFilterState) Clone() framework.StateData {
 }
 
 // New initializes a new plugin and returns it.
-func New(plArgs runtime.Object, handle framework.FrameworkHandle) (framework.Plugin, error) {
+func New(plArgs runtime.Object, handle framework.Handle) (framework.Plugin, error) {
 	args, err := getArgs(plArgs)
 	if err != nil {
 		return nil, err
@@ -95,6 +95,7 @@ type ServiceAffinity struct {
 var _ framework.PreFilterPlugin = &ServiceAffinity{}
 var _ framework.FilterPlugin = &ServiceAffinity{}
 var _ framework.ScorePlugin = &ServiceAffinity{}
+var _ framework.EnqueueExtensions = &ServiceAffinity{}
 
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *ServiceAffinity) Name() string {
@@ -108,14 +109,14 @@ func (pl *ServiceAffinity) createPreFilterState(pod *v1.Pod) (*preFilterState, e
 	// Store services which match the pod.
 	matchingPodServices, err := helper.GetPodServices(pl.serviceLister, pod)
 	if err != nil {
-		return nil, fmt.Errorf("listing pod services: %v", err.Error())
+		return nil, fmt.Errorf("listing pod services: %w", err)
 	}
 	selector := createSelectorFromLabels(pod.Labels)
 
 	// consider only the pods that belong to the same namespace
 	nodeInfos, err := pl.sharedLister.NodeInfos().List()
 	if err != nil {
-		return nil, fmt.Errorf("listing nodeInfos: %v", err.Error())
+		return nil, fmt.Errorf("listing nodeInfos: %w", err)
 	}
 	matchingPodList := filterPods(nodeInfos, selector, pod.Namespace)
 
@@ -133,7 +134,7 @@ func (pl *ServiceAffinity) PreFilter(ctx context.Context, cycleState *framework.
 
 	s, err := pl.createPreFilterState(pod)
 	if err != nil {
-		return framework.NewStatus(framework.Error, fmt.Sprintf("could not create preFilterState: %v", err))
+		return framework.AsStatus(fmt.Errorf("could not create preFilterState: %w", err))
 	}
 	cycleState.Write(preFilterStateKey, s)
 	return nil
@@ -148,40 +149,40 @@ func (pl *ServiceAffinity) PreFilterExtensions() framework.PreFilterExtensions {
 }
 
 // AddPod from pre-computed data in cycleState.
-func (pl *ServiceAffinity) AddPod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podToAdd *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (pl *ServiceAffinity) AddPod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podInfoToAdd *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
 	s, err := getPreFilterState(cycleState)
 	if err != nil {
-		return framework.NewStatus(framework.Error, err.Error())
+		return framework.AsStatus(err)
 	}
 
 	// If addedPod is in the same namespace as the pod, update the list
 	// of matching pods if applicable.
-	if podToAdd.Namespace != podToSchedule.Namespace {
+	if podInfoToAdd.Pod.Namespace != podToSchedule.Namespace {
 		return nil
 	}
 
 	selector := createSelectorFromLabels(podToSchedule.Labels)
-	if selector.Matches(labels.Set(podToAdd.Labels)) {
-		s.matchingPodList = append(s.matchingPodList, podToAdd)
+	if selector.Matches(labels.Set(podInfoToAdd.Pod.Labels)) {
+		s.matchingPodList = append(s.matchingPodList, podInfoToAdd.Pod)
 	}
 
 	return nil
 }
 
 // RemovePod from pre-computed data in cycleState.
-func (pl *ServiceAffinity) RemovePod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podToRemove *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (pl *ServiceAffinity) RemovePod(ctx context.Context, cycleState *framework.CycleState, podToSchedule *v1.Pod, podInfoToRemove *framework.PodInfo, nodeInfo *framework.NodeInfo) *framework.Status {
 	s, err := getPreFilterState(cycleState)
 	if err != nil {
-		return framework.NewStatus(framework.Error, err.Error())
+		return framework.AsStatus(err)
 	}
 
 	if len(s.matchingPodList) == 0 ||
-		podToRemove.Namespace != s.matchingPodList[0].Namespace {
+		podInfoToRemove.Pod.Namespace != s.matchingPodList[0].Namespace {
 		return nil
 	}
 
 	for i, pod := range s.matchingPodList {
-		if pod.Name == podToRemove.Name && pod.Namespace == podToRemove.Namespace {
+		if pod.Name == podInfoToRemove.Pod.Name && pod.Namespace == podInfoToRemove.Pod.Namespace {
 			s.matchingPodList = append(s.matchingPodList[:i], s.matchingPodList[i+1:]...)
 			break
 		}
@@ -194,7 +195,7 @@ func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error
 	c, err := cycleState.Read(preFilterStateKey)
 	if err != nil {
 		// preFilterState doesn't exist, likely PreFilter wasn't invoked.
-		return nil, fmt.Errorf("error reading %q from cycleState: %v", preFilterStateKey, err)
+		return nil, fmt.Errorf("error reading %q from cycleState: %w", preFilterStateKey, err)
 	}
 
 	if c == nil {
@@ -206,6 +207,28 @@ func getPreFilterState(cycleState *framework.CycleState) (*preFilterState, error
 		return nil, fmt.Errorf("%+v  convert to interpodaffinity.state error", c)
 	}
 	return s, nil
+}
+
+// EventsToRegister returns the possible events that may make a Pod
+// failed by this plugin schedulable.
+func (pl *ServiceAffinity) EventsToRegister() []framework.ClusterEvent {
+	if len(pl.args.AffinityLabels) == 0 {
+		return nil
+	}
+
+	return []framework.ClusterEvent{
+		// Suppose there is a running Pod backs a Service, and the unschedulable Pod subjects
+		// to the same Service, but failed because of mis-matched affinity labels.
+		// - if the running Pod's labels get updated, it may not back the Service anymore, and
+		//   hence make the unschedulable Pod schedulable.
+		// - if the running Pod gets deleted, the unschedulable Pod may also become schedulable.
+		{Resource: framework.Pod, ActionType: framework.Update | framework.Delete},
+		// A new Node or updating a Node's labels may make a Pod schedulable.
+		{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeLabel},
+		// Update or delete of a Service may break the correlation of the Pods that previously
+		// backed it, and hence make a Pod schedulable.
+		{Resource: framework.Service, ActionType: framework.Update | framework.Delete},
+	}
 }
 
 // Filter matches nodes in such a way to force that
@@ -239,12 +262,12 @@ func (pl *ServiceAffinity) Filter(ctx context.Context, cycleState *framework.Cyc
 
 	node := nodeInfo.Node()
 	if node == nil {
-		return framework.NewStatus(framework.Error, "node not found")
+		return framework.AsStatus(fmt.Errorf("node not found"))
 	}
 
 	s, err := getPreFilterState(cycleState)
 	if err != nil {
-		return framework.NewStatus(framework.Error, err.Error())
+		return framework.AsStatus(err)
 	}
 
 	pods, services := s.matchingPodList, s.matchingPodServices
@@ -257,7 +280,7 @@ func (pl *ServiceAffinity) Filter(ctx context.Context, cycleState *framework.Cyc
 			if len(filteredPods) > 0 {
 				nodeWithAffinityLabels, err := pl.sharedLister.NodeInfos().Get(filteredPods[0].Spec.NodeName)
 				if err != nil {
-					return framework.NewStatus(framework.Error, "node not found")
+					return framework.AsStatus(fmt.Errorf("node not found"))
 				}
 				addUnsetLabelsToMap(affinityLabels, pl.args.AffinityLabels, labels.Set(nodeWithAffinityLabels.Node().Labels))
 			}
@@ -275,12 +298,12 @@ func (pl *ServiceAffinity) Filter(ctx context.Context, cycleState *framework.Cyc
 func (pl *ServiceAffinity) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	nodeInfo, err := pl.sharedLister.NodeInfos().Get(nodeName)
 	if err != nil {
-		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
+		return 0, framework.AsStatus(fmt.Errorf("getting node %q from Snapshot: %w", nodeName, err))
 	}
 
 	node := nodeInfo.Node()
 	if node == nil {
-		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("node not found"))
+		return 0, framework.AsStatus(fmt.Errorf("node not found"))
 	}
 
 	// Pods matched namespace,selector on current node.
@@ -313,7 +336,7 @@ func (pl *ServiceAffinity) NormalizeScore(ctx context.Context, _ *framework.Cycl
 	reduceResult := make([]float64, len(scores))
 	for _, label := range pl.args.AntiAffinityLabelsPreference {
 		if err := pl.updateNodeScoresForLabel(pl.sharedLister, scores, reduceResult, label); err != nil {
-			return framework.NewStatus(framework.Error, err.Error())
+			return framework.AsStatus(err)
 		}
 	}
 
@@ -386,7 +409,7 @@ func (pl *ServiceAffinity) ScoreExtensions() framework.ScoreExtensions {
 // addUnsetLabelsToMap backfills missing values with values we find in a map.
 func addUnsetLabelsToMap(aL map[string]string, labelsToAdd []string, labelSet labels.Set) {
 	for _, l := range labelsToAdd {
-		// if the label is already there, dont overwrite it.
+		// if the label is already there, don't overwrite it.
 		if _, exists := aL[l]; exists {
 			continue
 		}

@@ -29,7 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 func TestGetNodeInfosForGroups(t *testing.T) {
@@ -197,8 +197,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 
 	// Fill cache manually
 	infoNg4Node6 := schedulerframework.NewNodeInfo()
-	err2 := infoNg4Node6.SetNode(ready6.DeepCopy())
-	assert.NoError(t, err2)
+	infoNg4Node6.SetNode(ready6.DeepCopy())
 	nodeInfoCache = map[string]*schedulerframework.NodeInfo{"ng4": infoNg4Node6}
 	// Check if cache was used
 	res, err = GetNodeInfosForGroups([]*apiv1.Node{ready1, ready2}, nodeInfoCache,

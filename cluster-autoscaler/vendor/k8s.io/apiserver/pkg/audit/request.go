@@ -23,9 +23,6 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/google/uuid"
-	"k8s.io/klog/v2"
-
 	authnv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +33,10 @@ import (
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/klog/v2"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -43,23 +44,20 @@ const (
 	userAgentTruncateSuffix = "...TRUNCATED"
 )
 
-func NewEventFromRequest(req *http.Request, level auditinternal.Level, attribs authorizer.Attributes) (*auditinternal.Event, error) {
+func NewEventFromRequest(req *http.Request, requestReceivedTimestamp time.Time, level auditinternal.Level, attribs authorizer.Attributes) (*auditinternal.Event, error) {
 	ev := &auditinternal.Event{
-		RequestReceivedTimestamp: metav1.NewMicroTime(time.Now()),
+		RequestReceivedTimestamp: metav1.NewMicroTime(requestReceivedTimestamp),
 		Verb:                     attribs.GetVerb(),
 		RequestURI:               req.URL.RequestURI(),
 		UserAgent:                maybeTruncateUserAgent(req),
 		Level:                    level,
 	}
 
-	// prefer the id from the headers. If not available, create a new one.
-	// TODO(audit): do we want to forbid the header for non-front-proxy users?
-	ids := req.Header.Get(auditinternal.HeaderAuditID)
-	if ids != "" {
-		ev.AuditID = types.UID(ids)
-	} else {
-		ev.AuditID = types.UID(uuid.New().String())
+	auditID, found := request.AuditIDFrom(req.Context())
+	if !found {
+		auditID = types.UID(uuid.New().String())
 	}
+	ev.AuditID = auditID
 
 	ips := utilnet.SourceIPs(req)
 	ev.SourceIPs = make([]string, len(ips))

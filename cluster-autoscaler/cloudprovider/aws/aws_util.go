@@ -34,7 +34,8 @@ var (
 	ec2MetaDataServiceUrl          = "http://169.254.169.254/latest/dynamic/instance-identity/document"
 	ec2PricingServiceUrlTemplate   = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/%s/index.json"
 	ec2PricingServiceUrlTemplateCN = "https://pricing.cn-north-1.amazonaws.com.cn/offers/v1.0/cn/AmazonEC2/current/%s/index.json"
-	staticListLastUpdateTime       = "2019-10-14"
+	staticListLastUpdateTime       = "2020-12-07"
+	ec2Arm64Processors             = []string{"AWS Graviton Processor", "AWS Graviton2 Processor"}
 )
 
 type response struct {
@@ -50,6 +51,7 @@ type productAttributes struct {
 	VCPU         string `json:"vcpu"`
 	Memory       string `json:"memory"`
 	GPU          string `json:"gpu"`
+	Architecture string `json:"physicalProcessor"`
 }
 
 // GenerateEC2InstanceTypes returns a map of ec2 resources
@@ -76,7 +78,7 @@ func GenerateEC2InstanceTypes(region string) (map[string]*InstanceType, error) {
 			klog.V(1).Infof("fetching %s\n", url)
 			res, err := http.Get(url)
 			if err != nil {
-				klog.Warningf("Error fetching %s skipping...\n", url)
+				klog.Warningf("Error fetching %s skipping...\n%s\n", url, err)
 				continue
 			}
 
@@ -109,6 +111,9 @@ func GenerateEC2InstanceTypes(region string) (map[string]*InstanceType, error) {
 					}
 					if attr.GPU != "" {
 						instanceTypes[attr.InstanceType].GPU = parseCPU(attr.GPU)
+					}
+					if attr.Architecture != "" {
+						instanceTypes[attr.InstanceType].Architecture = parseArchitecture(attr.Architecture)
 					}
 				}
 			}
@@ -148,6 +153,15 @@ func parseCPU(cpu string) int64 {
 		klog.Fatal(err)
 	}
 	return i
+}
+
+func parseArchitecture(archName string) string {
+	for _, processor := range ec2Arm64Processors {
+		if archName == processor {
+			return "arm64"
+		}
+	}
+	return "amd64"
 }
 
 // GetCurrentAwsRegion return region of current cluster without building awsManager

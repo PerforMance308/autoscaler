@@ -38,7 +38,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 	provider_aws "k8s.io/legacy-cloud-providers/aws"
 )
 
@@ -77,6 +77,7 @@ func TestBuildGenericLabels(t *testing.T) {
 			InstanceType: "c4.large",
 			VCPU:         2,
 			MemoryMb:     3840,
+			Architecture: cloudprovider.DefaultArch,
 		},
 		Region: "us-east-1",
 	}, "sillyname")
@@ -84,6 +85,7 @@ func TestBuildGenericLabels(t *testing.T) {
 	assert.Equal(t, "sillyname", labels[apiv1.LabelHostname])
 	assert.Equal(t, "c4.large", labels[apiv1.LabelInstanceType])
 	assert.Equal(t, cloudprovider.DefaultArch, labels[kubeletapis.LabelArch])
+	assert.Equal(t, cloudprovider.DefaultArch, labels[apiv1.LabelArchStable])
 	assert.Equal(t, cloudprovider.DefaultOS, labels[kubeletapis.LabelOS])
 }
 

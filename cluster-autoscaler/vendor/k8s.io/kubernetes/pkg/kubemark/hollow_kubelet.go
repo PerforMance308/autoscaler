@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -167,6 +167,7 @@ func GetHollowKubeletConfig(opt *HollowKubletOptions) (*options.KubeletFlags, *k
 	f.RegisterNode = true
 	f.RegisterSchedulable = true
 	f.RegisterWithTaints = opt.RegisterWithTaints
+	f.RemoteImageEndpoint = "/run/containerd/containerd.sock"
 
 	// Config struct
 	c, err := options.NewKubeletConfiguration()

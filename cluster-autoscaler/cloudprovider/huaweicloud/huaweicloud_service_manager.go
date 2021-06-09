@@ -18,8 +18,14 @@ package huaweicloud
 
 import (
 	"fmt"
+	"math/rand"
+	"strconv"
+	"strings"
 	"time"
 
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/core/sdktime"
@@ -27,7 +33,9 @@ import (
 	huaweicloudsdkasmodel "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/as/v1/model"
 	huaweicloudsdkecs "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/ecs/v2"
 	huaweicloudsdkecsmodel "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/huaweicloud/huaweicloud-sdk-go-v3/services/ecs/v2/model"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	"k8s.io/klog/v2"
+	kubeletapis "k8s.io/kubelet/pkg/apis"
 )
 
 // ElasticCloudServerService represents the elastic cloud server interfaces.
@@ -53,6 +61,21 @@ type AutoScalingService interface {
 	// The delta should be non-negative.
 	// IncreaseSizeInstance wait until instance number is updated.
 	IncreaseSizeInstance(groupID string, delta int) error
+
+	// GetAsgForInstance returns auto scaling group for the given instance.
+	GetAsgForInstance(instanceID string) (*AutoScalingGroup, error)
+
+	// RegisterAsg registers auto scaling group to manager
+	RegisterAsg(asg *AutoScalingGroup)
+
+	// DeleteScalingInstances is used to delete instances from auto scaling group by instanceIDs.
+	DeleteScalingInstances(groupID string, instanceIds []string) error
+
+	// Get default auto scaling group template
+	getAsgTemplate(groupID string) (*asgTemplate, error)
+
+	// buildNodeFromTemplate returns template from instance flavor
+	buildNodeFromTemplate(asgName string, template *asgTemplate) (*apiv1.Node, error)
 }
 
 // CloudServiceManager represents the cloud service interfaces.
@@ -69,14 +92,38 @@ type cloudServiceManager struct {
 	cloudConfig      *CloudConfig
 	getECSClientFunc func() *huaweicloudsdkecs.EcsClient
 	getASClientFunc  func() *huaweicloudsdkas.AsClient
+	asgs             *autoScalingGroupCache
+}
+
+type asgTemplate struct {
+	name   string
+	vcpu   int64
+	ram    int64
+	gpu    int64
+	region string
+	zone   string
+	tags   map[string]string
 }
 
 func newCloudServiceManager(cloudConfig *CloudConfig) *cloudServiceManager {
-	return &cloudServiceManager{
+	csm := &cloudServiceManager{
 		cloudConfig:      cloudConfig,
 		getECSClientFunc: cloudConfig.getECSClient,
 		getASClientFunc:  cloudConfig.getASClient,
+		asgs:             newAutoScalingGroupCache(),
 	}
+
+	csm.asgs.generateCache(csm)
+
+	return csm
+}
+
+func (csm *cloudServiceManager) GetAsgForInstance(instanceID string) (*AutoScalingGroup, error) {
+	return csm.asgs.FindForInstance(instanceID, csm)
+}
+
+func (csm *cloudServiceManager) RegisterAsg(asg *AutoScalingGroup) {
+	csm.asgs.Register(asg)
 }
 
 // DeleteServers deletes a group of server by ID.
@@ -179,6 +226,11 @@ func (csm *cloudServiceManager) GetInstances(groupID string) ([]cloudprovider.In
 
 	instances := make([]cloudprovider.Instance, 0, len(*response.ScalingGroupInstances))
 	for _, sgi := range *response.ScalingGroupInstances {
+		// When a new instance joining to the scaling group, the instance id maybe empty(nil).
+		if sgi.InstanceId == nil {
+			klog.Infof("ignore instance without instance id, maybe instance is joining.")
+			continue
+		}
 		instance := cloudprovider.Instance{
 			Id:     *sgi.InstanceId,
 			Status: csm.transformInstanceState(*sgi.LifeCycleState, *sgi.HealthStatus),
@@ -187,6 +239,29 @@ func (csm *cloudServiceManager) GetInstances(groupID string) ([]cloudprovider.In
 	}
 
 	return instances, nil
+}
+
+func (csm *cloudServiceManager) DeleteScalingInstances(groupID string, instanceIds []string) error {
+	asClient := csm.getASClientFunc()
+
+	instanceDelete := "yes"
+	opts := &huaweicloudsdkasmodel.UpdateScalingGroupInstanceRequest{
+		ScalingGroupId: groupID,
+		Body: &huaweicloudsdkasmodel.UpdateScalingGroupInstanceRequestBody{
+			InstancesId:    instanceIds,
+			InstanceDelete: &instanceDelete,
+			Action:         huaweicloudsdkasmodel.GetUpdateScalingGroupInstanceRequestBodyActionEnum().REMOVE,
+		},
+	}
+
+	_, err := asClient.UpdateScalingGroupInstance(opts)
+
+	if err != nil {
+		klog.Errorf("failed to delete scaling instances. group: %s, error: %v", groupID, err)
+		return err
+	}
+
+	return nil
 }
 
 // IncreaseSizeInstance increases a scaling group's instance size.
@@ -266,9 +341,9 @@ func (csm *cloudServiceManager) ListScalingGroups() ([]AutoScalingGroup, error) 
 		return nil, fmt.Errorf("failed to list scaling groups due to can not get as client")
 	}
 
-	requiredState := huaweicloudsdkasmodel.GetListScalingGroupsRequestScalingGroupStatusEnum().INSERVICE
+	// requiredState := huaweicloudsdkasmodel.GetListScalingGroupsRequestScalingGroupStatusEnum().INSERVICE
 	opts := &huaweicloudsdkasmodel.ListScalingGroupsRequest{
-		ScalingGroupStatus: &requiredState,
+		// ScalingGroupStatus: &requiredState,
 	}
 	response, err := asClient.ListScalingGroups(opts)
 	if err != nil {
@@ -383,4 +458,130 @@ func (csm *cloudServiceManager) deleteScalingPolicy(opts *huaweicloudsdkasmodel.
 
 	klog.V(1).Infof("delete scaling policy succeed. policy id: %s", opts.ScalingPolicyId)
 	return nil
+}
+
+func (csm *cloudServiceManager) getScalingGroupByID(groupID string) (*huaweicloudsdkasmodel.ScalingGroups, error) {
+	asClient := csm.getASClientFunc()
+	opts := &huaweicloudsdkasmodel.ShowScalingGroupRequest{
+		ScalingGroupId: groupID,
+	}
+	response, err := asClient.ShowScalingGroup(opts)
+	if err != nil {
+		klog.Errorf("failed to show scaling group info. group: %s, error: %v", groupID, err)
+		return nil, err
+	}
+	if response == nil || response.ScalingGroup == nil {
+		return nil, fmt.Errorf("no scaling group found: %s", groupID)
+	}
+
+	return response.ScalingGroup, nil
+}
+
+func (csm *cloudServiceManager) getScalingGroupConfigByID(groupID, configID string) (*huaweicloudsdkasmodel.ScalingConfiguration, error) {
+	asClient := csm.getASClientFunc()
+	opts := &huaweicloudsdkasmodel.ShowScalingConfigRequest{
+		ScalingConfigurationId: configID,
+	}
+	response, err := asClient.ShowScalingConfig(opts)
+	if err != nil {
+		klog.Errorf("failed to show scaling group config. config id: %s, error: %v", configID, err)
+		return nil, err
+	}
+	if response == nil || response.ScalingConfiguration == nil {
+		return nil, fmt.Errorf("no scaling configuration found, groupID: %s, configID: %s", groupID, configID)
+	}
+	return response.ScalingConfiguration, nil
+}
+
+func (csm *cloudServiceManager) listFlavors(az string) (*[]huaweicloudsdkecsmodel.Flavor, error) {
+	ecsClient := csm.getECSClientFunc()
+	opts := &huaweicloudsdkecsmodel.ListFlavorsRequest{
+		AvailabilityZone: &az,
+	}
+	response, err := ecsClient.ListFlavors(opts)
+	if err != nil {
+		klog.Errorf("failed to list flavors. availability zone: %s", az)
+		return nil, err
+	}
+
+	return response.Flavors, nil
+}
+
+func (csm *cloudServiceManager) getAsgTemplate(groupID string) (*asgTemplate, error) {
+	sg, err := csm.getScalingGroupByID(groupID)
+	if err != nil {
+		klog.Errorf("failed to get ASG by id:%s,because of %s", groupID, err.Error())
+		return nil, err
+	}
+
+	configuration, err := csm.getScalingGroupConfigByID(groupID, *sg.ScalingConfigurationId)
+
+	for _, az := range *sg.AvailableZones {
+		flavors, err := csm.listFlavors(az)
+		if err != nil {
+			klog.Errorf("failed to list flavors, available zone is: %s, error: %v", az, err)
+			return nil, err
+		}
+
+		for _, flavor := range *flavors {
+			if !strings.EqualFold(flavor.Name, *configuration.InstanceConfig.FlavorRef) {
+				continue
+			}
+
+			vcpus, _ := strconv.ParseInt(flavor.Vcpus, 10, 64)
+			return &asgTemplate{
+				name: flavor.Name,
+				vcpu: vcpus,
+				ram:  int64(flavor.Ram),
+				zone: az,
+			}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (csm *cloudServiceManager) buildNodeFromTemplate(asgName string, template *asgTemplate) (*apiv1.Node, error) {
+	node := apiv1.Node{}
+	nodeName := fmt.Sprintf("%s-asg-%d", asgName, rand.Int63())
+
+	node.ObjectMeta = metav1.ObjectMeta{
+		Name:     nodeName,
+		SelfLink: fmt.Sprintf("/api/v1/nodes/%s", nodeName),
+		Labels:   map[string]string{},
+	}
+
+	node.Status = apiv1.NodeStatus{
+		Capacity: apiv1.ResourceList{},
+	}
+
+	node.Status.Capacity[apiv1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewQuantity(template.vcpu, resource.DecimalSI)
+	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(template.gpu, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.ram*1024*1024, resource.DecimalSI)
+
+	node.Status.Allocatable = node.Status.Capacity
+
+	node.Labels = cloudprovider.JoinStringMaps(node.Labels, buildGenericLabels(template, nodeName))
+
+	node.Status.Conditions = cloudprovider.BuildReadyConditions()
+	return &node, nil
+}
+
+func buildGenericLabels(template *asgTemplate, nodeName string) map[string]string {
+	result := make(map[string]string)
+	result[kubeletapis.LabelArch] = cloudprovider.DefaultArch
+	result[kubeletapis.LabelOS] = cloudprovider.DefaultOS
+
+	result[apiv1.LabelInstanceType] = template.name
+
+	result[apiv1.LabelZoneRegion] = template.region
+	result[apiv1.LabelZoneFailureDomain] = template.zone
+	result[apiv1.LabelHostname] = nodeName
+
+	// append custom node labels
+	for key, value := range template.tags {
+		result[key] = value
+	}
+
+	return result
 }

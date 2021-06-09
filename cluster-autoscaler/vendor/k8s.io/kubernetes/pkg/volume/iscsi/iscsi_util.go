@@ -30,8 +30,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	utilexec "k8s.io/utils/exec"
-	"k8s.io/utils/mount"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/kubelet/config"
@@ -791,7 +791,7 @@ func extractDeviceAndPrefix(mntPath string) (string, string, error) {
 
 func extractIface(mntPath string) (string, bool) {
 	reOutput := ifaceRe.FindStringSubmatch(mntPath)
-	if reOutput != nil && len(reOutput) > 1 {
+	if len(reOutput) > 1 {
 		return reOutput[1], true
 	}
 
